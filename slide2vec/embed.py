@@ -1,5 +1,7 @@
 import os
 import tqdm
+import h5py
+import glob
 import torch
 import argparse
 import traceback
@@ -74,32 +76,90 @@ def deduplicate_features(indices_all, wsi_feature):
     return dedup_features, unique_idxs
 
 
-def run_inference(dataloader, model, device, autocast_context, unit, batch_size):
+def run_inference(features_dir, tmp_dir, dataloader, model, device, autocast_context, unit, batch_size):
     """
-    Run inference on the provided dataloader and return concatenated features and indices.
+    Run inference on the provided dataloader and return a temporary dir unique to filename and rank.
     """
+    # Infer total samples per rank (roughly), assuming the dataset is evenly split among ranks
+    try:
+        total_samples = len(dataloader.dataset) // distributed.get_local_size() #get_global_size()?
+    except Exception:
+        raise ValueError("Could not determine dataset length.")
+    
+    # Get feature shape using a dry run
+    model.eval()
+    with torch.inference_mode(), autocast_context:
+        sample_batch = next(iter(dataloader))
+        sample_input = sample_batch[1].to(device)
+        sample_output = model(sample_input)
+        feature_shape = sample_output.shape[1:]  # (C,) or (C, H, W)
+
+    #print("Before inference ", torch.cuda.memory_allocated() / 1024**2, "MB allocated")
+    
+    # Create HDF5 datasets
+    with torch.inference_mode(), autocast_context:
+        for batch in tqdm.tqdm(
+            dataloader,
+            desc=f"Inference on GPU {distributed.get_local_rank()}",
+            unit=unit,
+            unit_scale=batch_size,
+            leave=False,
+            position=2 + distributed.get_local_rank(),
+        ):
+            #print("Inside for batch in tqdm ", distributed.get_local_rank(), " rank")
+            hdf5_path = os.path.join(tmp_dir, f"features_rank{distributed.get_local_rank()}.h5") #get_global_rank() instead of get_local_rank()?
+            #print("HDF5 path: ", hdf5_path)
+            
+            idx, image = batch
+            batch_size = image.size(0)
+            image = image.to(device, non_blocking=True)
+
+            with torch.inference_mode(), autocast_context:
+                feature = model(image).cpu()
+
+            # Check if hdf5 file already exists, if not create it, if yes, append to it
+            if not os.path.exists(hdf5_path):
+                offset = 0
+                # Create HDF5 file and datasets
+                with h5py.File(hdf5_path, "w") as f:
+                    features_dset = f.create_dataset("features", shape=(total_samples, *feature_shape))
+                    indices_dset = f.create_dataset("indices", shape=(total_samples,))
+                    #
+                    # Write to HDF5
+                    features_dset[offset:offset+batch_size] = feature
+                    indices_dset[offset:offset+batch_size] = idx
+                    offset += batch_size
+            else:
+                # Append to existing HDF5 file
+                with h5py.File(hdf5_path, "a") as f:
+                    features_dset = f["features"]
+                    indices_dset = f["indices"]
+                    #
+                    # Write to HDF5
+                    features_dset[offset:offset+batch_size] = feature
+                    indices_dset[offset:offset+batch_size] = idx
+                    offset += batch_size
+            # Clear memory
+            del image, feature, idx
+            torch.cuda.empty_cache()
+    return None
+
+def load_all_features(tmp_dir):
     features_list = []
     indices_list = []
-    with torch.inference_mode():
-        with autocast_context:
-            for batch in tqdm.tqdm(
-                dataloader,
-                desc=f"Inference on GPU {distributed.get_local_rank()}",
-                unit=unit,
-                unit_scale=batch_size,
-                leave=False,
-                position=2 + distributed.get_local_rank(),
-            ):
-                idx, image = batch
-                image = image.to(device, non_blocking=True)
-                feature = model(image)
-                features_list.append(feature)
-                indices_list.append(idx.to(device, non_blocking=True))
-    features = torch.cat(features_list, dim=0)
-    indices = torch.cat(indices_list, dim=0)
-    return features, indices
 
+    for path in sorted(glob.glob(os.path.join(tmp_dir, "features_rank*.h5"))):
+        with h5py.File(path, "r") as f:
+            features_list.append(torch.from_numpy(f["features"][:]))
+            indices_list.append(torch.from_numpy(f["indices"][:]))
+    
+    # Remove the temporary file in hdf5_path
+    os.remove(tmp_dir)
 
+    return torch.cat(features_list, dim=0), torch.cat(indices_list, dim=0)
+
+# from torch.distributed.elastic.multiprocessing.errors import record
+# @record
 def main(args):
     # setup configuration
     cfg = get_cfg_from_file(args.config_file)
@@ -181,8 +241,15 @@ def main(args):
                 num_workers=num_workers,
                 pin_memory=True,
             )
+            # Temporary directory
+            # Get the filename without extension from wsi_fp 
+            wsi_filename = os.path.splitext(os.path.basename(wsi_fp))[0]
+            tmp_dir = Path(features_dir, "tmp", wsi_filename)
+            os.makedirs(tmp_dir, exist_ok=True)
 
-            features, indices = run_inference(
+            run_inference(
+                features_dir, #Added to store temporary features chunks
+                tmp_dir,
                 dataloader,
                 model,
                 model.device,
@@ -190,6 +257,8 @@ def main(args):
                 unit,
                 cfg.model.batch_size,
             )
+
+            features, indices = load_all_features(tmp_dir)
 
             # gather features from all gpus if needed
             if distributed.is_enabled_and_multiple_gpus():
@@ -290,6 +359,10 @@ def main(args):
             f"Completed feature extraction: {total_slides - len(failed_feature_extraction)}"
         )
         print("=+=" * 10)
+    
+    #Remove the temporary directory
+    tmp_dir_super = Path(features_dir, "tmp")
+    os.rmdir(tmp_dir_super)
 
 
 if __name__ == "__main__":
