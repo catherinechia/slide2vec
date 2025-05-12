@@ -3,6 +3,7 @@ import tqdm
 import h5py
 import glob
 import torch
+import shutil
 import argparse
 import traceback
 import torchvision
@@ -153,8 +154,9 @@ def load_all_features(tmp_dir):
             features_list.append(torch.from_numpy(f["features"][:]))
             indices_list.append(torch.from_numpy(f["indices"][:]))
     
-    # Remove the temporary file in hdf5_path
-    os.remove(tmp_dir)
+    # Remove all the files in tmp_dir
+    for path in sorted(glob.glob(os.path.join(tmp_dir, "features_rank*.h5"))):
+        os.remove(path)
 
     return torch.cat(features_list, dim=0), torch.cat(indices_list, dim=0)
 
@@ -362,7 +364,7 @@ def main(args):
     
     #Remove the temporary directory
     tmp_dir_super = Path(features_dir, "tmp")
-    os.rmdir(tmp_dir_super)
+    shutil.rmtree(tmp_dir_super, ignore_errors=True)
 
 
 if __name__ == "__main__":
